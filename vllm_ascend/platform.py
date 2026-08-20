@@ -41,6 +41,7 @@ from vllm_ascend.utils import (
     COMPILATION_PASS_KEY,
     COMPRESSED_TENSORS_METHOD,
     FP8_METHOD,
+    MXFP8_METHOD,
     AscendDeviceType,
     bootstrap_custom_op_env,
     check_kv_extra_config,
@@ -141,6 +142,7 @@ class NPUPlatform(Platform):
         ASCEND_QUANTIZATION_METHOD,
         COMPRESSED_TENSORS_METHOD,
         FP8_METHOD,
+        MXFP8_METHOD,
         "deepseek_v4_fp8",
     ]
 
@@ -195,9 +197,12 @@ class NPUPlatform(Platform):
             if quant_action and hasattr(quant_action, "choices") and quant_action.choices:
                 if ASCEND_QUANTIZATION_METHOD not in quant_action.choices:
                     quant_action.choices.append(ASCEND_QUANTIZATION_METHOD)
+                if MXFP8_METHOD not in quant_action.choices:
+                    quant_action.choices.append(MXFP8_METHOD)
 
         if not is_310p():
             from vllm_ascend.quantization import AscendCompressedTensorsConfig, AscendFp8Config, AscendModelSlimConfig  # noqa: F401
+            from vllm_ascend.quantization.mxfp8_config import AscendMxfp8Config  # noqa: F401
         else:
             from vllm_ascend._310p.quantization import AscendModelSlimConfig310  # noqa: F401
 

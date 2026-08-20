@@ -125,6 +125,10 @@ class AscendLinearMethod(LinearMethodBase):
         if hasattr(self.quant_method, "process_weights_after_loading"):
             self.quant_method.process_weights_after_loading(layer)
 
+    def restore_weights_for_rl_loading(self, layer: torch.nn.Module) -> None:
+        if hasattr(self.quant_method, "restore_weights_for_rl_loading"):
+            self.quant_method.restore_weights_for_rl_loading(layer)
+
     def get_computed_params(self) -> set[str]:
         """Return parameter name patterns that are computed, not loaded.
 
@@ -300,6 +304,10 @@ class AscendFusedMoEMethod(FusedMoEMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if hasattr(self.quant_method, "process_weights_after_loading"):
             self.quant_method.process_weights_after_loading(layer)
+
+    def restore_weights_for_rl_loading(self, layer: torch.nn.Module) -> None:
+        if hasattr(self.quant_method, "restore_weights_for_rl_loading"):
+            self.quant_method.restore_weights_for_rl_loading(layer)
 
     def get_fused_moe_quant_config(self, layer: torch.nn.Module):
         pass

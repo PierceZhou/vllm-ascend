@@ -15,6 +15,7 @@
 # limitations under the License.
 #
 
+import importlib
 from collections.abc import Callable
 from typing import Any
 
@@ -23,6 +24,7 @@ import torch.nn.functional as F
 import torch_npu
 from vllm.config import CompilationMode, get_current_vllm_config
 from vllm.logger import logger
+from vllm.model_executor.utils import replace_parameter
 from vllm.utils.math_utils import cdiv
 
 from vllm_ascend.ascend_config import get_ascend_config
@@ -40,6 +42,209 @@ from .base import AscendLinearScheme, AscendMoEScheme, QuantType, get_moe_num_lo
 from .registry import register_scheme
 
 
+_ONLINE_WEIGHT_DTYPES = (torch.float16, torch.bfloat16)
+_ONLINE_COMPUTED_SCALE_NAMES = frozenset(
+    {
+        'weight_scale',
+        'w13_weight_scale',
+        'w2_weight_scale',
+    }
+)
+
+
+def _register_online_generated_scales_for_layerwise_reload() -> dict[str, tuple[str, ...]]:
+    '''Exclude online MXFP8 scales from checkpoint weight-load accounting.
+
+    Online MXFP8 checkpoints contain only FP16/BF16 weights. Their E8M0 scales
+    are produced by ``npu_dynamic_mx_quant`` after a layer's weight has loaded,
+    so waiting for scale tensors from the checkpoint prevents vLLM's layerwise
+    loader from finalizing any linear layer. The buffered BF16 weights then
+    accumulate across the whole model.
+
+    vLLM releases use different skip-set names and import styles. Update every
+    live binding used by metadata restoration and load accounting, including
+    module-local copies and immutable sets. The registration is process-local,
+    idempotent, and fails early when the installed API cannot be patched.
+    '''
+    module_names = (
+        'vllm.model_executor.model_loader.reload.meta',
+        'vllm.model_executor.model_loader.reload.layerwise',
+        'vllm.model_executor.model_loader.reload.utils',
+    )
+    skip_set_names = ('SKIP_LOAD_TENSORS', 'SKIP_TENSORS')
+    registered: dict[str, tuple[str, ...]] = {}
+
+    for module_name in module_names:
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+
+        updated_names = []
+        for skip_set_name in skip_set_names:
+            current = getattr(module, skip_set_name, None)
+            if current is None:
+                continue
+
+            try:
+                updated = set(current) | set(_ONLINE_COMPUTED_SCALE_NAMES)
+            except TypeError:
+                continue
+            # Always rebind. vLLM 0.23 aliases SKIP_TENSORS across meta.py and
+            # utils.py; mutating the shared object would make a unit of the
+            # registration impossible to roll back and obscures which binding
+            # the accounting function actually reads.
+            setattr(module, skip_set_name, updated)
+
+            if _ONLINE_COMPUTED_SCALE_NAMES.issubset(updated):
+                updated_names.append(skip_set_name)
+
+        if updated_names:
+            registered[module_name] = tuple(updated_names)
+
+    try:
+        reload_utils = importlib.import_module(
+            'vllm.model_executor.model_loader.reload.utils'
+        )
+        get_layer_size = reload_utils.get_layer_size
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError(
+            'Online MXFP8 could not locate vLLM layerwise load accounting.'
+        ) from exc
+
+    # Validate the behavior used by layerwise.py, rather than assuming a
+    # particular module exposes a particular set name. This catches copied or
+    # rebound skip sets before a real model update allocates checkpoint buffers.
+    probe = torch.nn.Module()
+    for name in ('weight', *_ONLINE_COMPUTED_SCALE_NAMES):
+        probe.register_parameter(
+            name,
+            torch.nn.Parameter(torch.empty(1, device='meta'), requires_grad=False),
+        )
+    if get_layer_size(probe) != probe.weight.numel():
+        raise RuntimeError(
+            'Online MXFP8 computed scale tensors are still included in vLLM '
+            'layerwise load accounting. BF16 checkpoint weights would '
+            'accumulate on device until finish_weight_update().'
+        )
+
+    logger.info_once(
+        'Online MXFP8 layerwise reload skips computed scales via %s.',
+        ', '.join(
+            f'{module_name.rsplit(".", 1)[-1]}.{name}'
+            for module_name, names in registered.items()
+            for name in names
+        ),
+    )
+    return registered
+
+def _to_mxfp8_scale_storage(scale: torch.Tensor, context: str) -> torch.Tensor:
+    '''Return the E8M0 scale in the uint8 storage expected by Ascend kernels.'''
+    scale = scale.contiguous()
+    if scale.dtype == torch.uint8:
+        return scale
+    if scale.element_size() != 1:
+        raise RuntimeError(
+            f'{context} produced an unsupported scale dtype {scale.dtype}; '
+            'MXFP8 E8M0 scales must use one byte per element.'
+        )
+    return scale.view(torch.uint8)
+
+
+def _quantize_online_weight(
+    weight: torch.Tensor,
+    group_size: int,
+    context: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    '''Quantize one FP16/BF16 weight tensor to E4M3 plus block E8M0 scales.'''
+    if weight.dtype not in _ONLINE_WEIGHT_DTYPES:
+        raise TypeError(
+            f'{context} expects an FP16/BF16 checkpoint weight before online '
+            f'MXFP8 quantization, but received {weight.dtype}.'
+        )
+    if weight.shape[-1] % group_size != 0:
+        raise ValueError(
+            f'{context} requires the input dimension ({weight.shape[-1]}) to '
+            f'be divisible by the MXFP8 group size ({group_size}).'
+        )
+
+    original_shape = tuple(weight.shape)
+    quantization_input = weight.contiguous().view(-1, original_shape[-1])
+    quantized_weight, weight_scale = torch_npu.npu_dynamic_mx_quant(
+        quantization_input,
+        dst_type=torch.float8_e4m3fn,
+    )
+    expected_flat_scale_shape = (
+        quantization_input.shape[0],
+        original_shape[-1] // group_size,
+    )
+    if tuple(quantized_weight.shape) != tuple(quantization_input.shape):
+        raise RuntimeError(
+            f'{context} returned weight shape {tuple(quantized_weight.shape)}, '
+            f'expected {tuple(quantization_input.shape)}.'
+        )
+    # torch_npu versions expose the E8M0 scale in either logical layout
+    # [rows, groups] or packed layout [rows, ceil(groups / 2), 2].  Normalize
+    # both forms here; process_weights_after_loading() performs the final
+    # transpose into the layout consumed by npu_quant_matmul.
+    returned_scale_shape = tuple(weight_scale.shape)
+    weight_scale = _to_mxfp8_scale_storage(weight_scale, context)
+    scale_rows, scale_groups = expected_flat_scale_shape
+    try:
+        flat_scale = weight_scale.reshape(scale_rows, -1)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f'{context} returned scale shape {returned_scale_shape}, which '
+            f'cannot be normalized to {expected_flat_scale_shape}.'
+        ) from exc
+
+    padded_scale_groups = cdiv(scale_groups, 2) * 2
+    if flat_scale.shape[1] not in (scale_groups, padded_scale_groups):
+        raise RuntimeError(
+            f'{context} returned scale shape {returned_scale_shape} with '
+            f'{flat_scale.shape[1]} values per row; expected {scale_groups} '
+            f'logical values or {padded_scale_groups} packed values.'
+        )
+    weight_scale = flat_scale[:, :scale_groups]
+    expected_scale_shape = (*original_shape[:-1], original_shape[-1] // group_size)
+    quantized_weight = quantized_weight.view(original_shape).contiguous()
+    weight_scale = weight_scale.reshape(expected_scale_shape).contiguous()
+    return quantized_weight, weight_scale
+
+
+def _allocate_reload_parameter(
+    layer: torch.nn.Module,
+    name: str,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+) -> None:
+    '''Replace a runtime MXFP8 parameter with an empty checkpoint-format one.'''
+    current = getattr(layer, name)
+    checkpoint_tensor = torch.empty(shape, dtype=dtype, device=current.device)
+    replace_parameter(layer, name, checkpoint_tensor)
+
+
+def _record_or_validate_runtime_layout(
+    layer: torch.nn.Module,
+    tensor_names: tuple[str, ...],
+    context: str,
+) -> None:
+    """Require a stable post-load contract for graph-captured tensors."""
+    signature = {
+        name: (tuple(getattr(layer, name).shape), tuple(getattr(layer, name).stride()), getattr(layer, name).dtype)
+        for name in tensor_names
+    }
+    expected = getattr(layer, '_mxfp8_runtime_layout', None)
+    if expected is None:
+        layer._mxfp8_runtime_layout = signature
+        return
+    if signature != expected:
+        raise RuntimeError(
+            f'{context} changed MXFP8 runtime layout: '
+            f'expected={expected}, actual={signature}. ACL Graph replay is unsafe.'
+        )
+
+
 @register_scheme("W8A8_MXFP8", "linear")
 class AscendW8A8MXFP8DynamicLinearMethod(AscendLinearScheme):
     """Linear method for Ascend W8A8_MXFP8 (Microscaling FP8) quantization.
@@ -51,12 +256,17 @@ class AscendW8A8MXFP8DynamicLinearMethod(AscendLinearScheme):
 
     model_dtype = None
 
-    def __init__(self):
+    def __init__(self, online_quantization: bool = False):
         ensure_mxfp8_linear_available("W8A8_MXFP8 linear quantization")
+        self.online_quantization = online_quantization
+        if self.online_quantization:
+            _register_online_generated_scales_for_layerwise_reload()
         vllm_config = get_current_vllm_config()
         self.group_size = vllm_config.quant_config.quant_description.get("group_size", 32)
 
     def get_weight(self, input_size: int, output_size: int, params_dtype: torch.dtype) -> dict[str, Any]:
+        if self.online_quantization:
+            return {'weight': torch.empty(output_size, input_size, dtype=params_dtype)}
         params_dict = {"weight": torch.empty(output_size, input_size, dtype=torch.float8_e4m3fn)}
         return params_dict
 
@@ -119,9 +329,25 @@ class AscendW8A8MXFP8DynamicLinearMethod(AscendLinearScheme):
         method again after loading.
         """
 
-        # Check if already transformed to avoid double transformation
+        # Layerwise reload restores the checkpoint dtype but keeps module flags.
+        if self.online_quantization and layer.weight.dtype in _ONLINE_WEIGHT_DTYPES:
+            layer._mxfp8_transformed = False
         if getattr(layer, "_mxfp8_transformed", False):
             return
+
+        if self.online_quantization:
+            if not hasattr(layer, '_mxfp8_online_checkpoint'):
+                layer._mxfp8_online_checkpoint = {
+                    'weight': (tuple(layer.weight.shape), layer.weight.dtype),
+                    'weight_scale': tuple(layer.weight_scale.shape),
+                }
+            quantized_weight, weight_scale = _quantize_online_weight(
+                layer.weight.data,
+                self.group_size,
+                'Ascend online MXFP8 linear quantization',
+            )
+            replace_parameter(layer, 'weight', quantized_weight)
+            replace_parameter(layer, 'weight_scale', weight_scale)
 
         # Store original shapes for RL weight reloading
         # Only store on first call (when shapes are in original format)
@@ -140,6 +366,13 @@ class AscendW8A8MXFP8DynamicLinearMethod(AscendLinearScheme):
             layer.weight_scale.data = layer.weight_scale.data.reshape(n_dim, k_dim // 2, 2)
         layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
         layer.weight_scale.data = layer.weight_scale.data.transpose(0, 1).contiguous()
+
+        if self.online_quantization:
+            _record_or_validate_runtime_layout(
+                layer,
+                ('weight', 'weight_scale'),
+                'Ascend online MXFP8 linear quantization',
+            )
 
         # Mark as transformed
         layer._mxfp8_transformed = True
@@ -161,6 +394,19 @@ class AscendW8A8MXFP8DynamicLinearMethod(AscendLinearScheme):
 
         if not getattr(layer, "_mxfp8_transformed", False):
             # Not transformed, nothing to restore
+            return
+
+        if self.online_quantization:
+            checkpoint_state = layer._mxfp8_online_checkpoint
+            weight_shape, weight_dtype = checkpoint_state['weight']
+            _allocate_reload_parameter(layer, 'weight', weight_shape, weight_dtype)
+            _allocate_reload_parameter(
+                layer,
+                'weight_scale',
+                checkpoint_state['weight_scale'],
+                torch.uint8,
+            )
+            layer._mxfp8_transformed = False
             return
 
         if not hasattr(layer, "_mxfp8_original_shapes"):
@@ -198,11 +444,14 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
     model_dtype = None
     quant_type: QuantType = QuantType.MXFP8
 
-    def __init__(self):
+    def __init__(self, online_quantization: bool = False):
         ensure_mxfp8_moe_available("W8A8_MXFP8 MoE quantization")
 
         vllm_config = get_current_vllm_config()
         self.group_size = vllm_config.quant_config.quant_description.get("group_size", 32)
+        self.online_quantization = online_quantization
+        if self.online_quantization:
+            _register_online_generated_scales_for_layerwise_reload()
         ascend_config = get_ascend_config()
         self.use_aclgraph = (
             vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE
@@ -211,10 +460,28 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
         self.dynamic_eplb = ascend_config.eplb_config.dynamic_eplb
         self.multistream_overlap_gate = ascend_config.multistream_overlap_gate
 
-    @staticmethod
     def get_weight(
-        num_experts: int, intermediate_size_per_partition: int, hidden_sizes: int, params_dtype: torch.dtype
+        self,
+        num_experts: int,
+        intermediate_size_per_partition: int,
+        hidden_sizes: int,
+        params_dtype: torch.dtype,
     ) -> dict[str, Any]:
+        if self.online_quantization:
+            return {
+                'w13_weight': torch.empty(
+                    num_experts,
+                    2 * intermediate_size_per_partition,
+                    hidden_sizes,
+                    dtype=params_dtype,
+                ),
+                'w2_weight': torch.empty(
+                    num_experts,
+                    hidden_sizes,
+                    intermediate_size_per_partition,
+                    dtype=params_dtype,
+                ),
+            }
         param_dict = {}
         param_dict["w13_weight"] = torch.empty(
             num_experts, 2 * intermediate_size_per_partition, hidden_sizes, dtype=torch.float8_e4m3fn
@@ -351,7 +618,9 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
         method again after loading.
         """
 
-        # Check if already transformed to avoid double transformation
+        # Layerwise reload restores the checkpoint dtype but keeps module flags.
+        if self.online_quantization and layer.w13_weight.dtype in _ONLINE_WEIGHT_DTYPES:
+            layer._mxfp8_transformed = False
         if getattr(layer, "_mxfp8_transformed", False):
             return
 
@@ -365,6 +634,29 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
                 "w2_weight_scale": tuple(layer.w2_weight_scale.data.shape),
             }
 
+        if self.online_quantization:
+            if not hasattr(layer, '_mxfp8_online_checkpoint'):
+                layer._mxfp8_online_checkpoint = {
+                    'w13_weight': (tuple(layer.w13_weight.shape), layer.w13_weight.dtype),
+                    'w13_weight_scale': tuple(layer.w13_weight_scale.shape),
+                    'w2_weight': (tuple(layer.w2_weight.shape), layer.w2_weight.dtype),
+                    'w2_weight_scale': tuple(layer.w2_weight_scale.shape),
+                }
+            w13_weight, w13_weight_scale = _quantize_online_weight(
+                layer.w13_weight.data,
+                self.group_size,
+                'Ascend online MXFP8 MoE w13 quantization',
+            )
+            w2_weight, w2_weight_scale = _quantize_online_weight(
+                layer.w2_weight.data,
+                self.group_size,
+                'Ascend online MXFP8 MoE w2 quantization',
+            )
+            replace_parameter(layer, 'w13_weight', w13_weight)
+            replace_parameter(layer, 'w13_weight_scale', w13_weight_scale)
+            replace_parameter(layer, 'w2_weight', w2_weight)
+            replace_parameter(layer, 'w2_weight_scale', w2_weight_scale)
+
         g_num, n_size, k_size = layer.w13_weight_scale.shape
         layer.w13_weight_scale.data = layer.w13_weight_scale.data.reshape(g_num, n_size, k_size // 2, 2)
         g_num, n_size, k_size = layer.w2_weight_scale.shape
@@ -373,6 +665,13 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
         layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2)
         layer.w13_weight_scale.data = layer.w13_weight_scale.data.transpose(1, 2)
         layer.w2_weight_scale.data = layer.w2_weight_scale.data.transpose(1, 2)
+
+        if self.online_quantization:
+            _record_or_validate_runtime_layout(
+                layer,
+                ('w13_weight', 'w13_weight_scale', 'w2_weight', 'w2_weight_scale'),
+                'Ascend online MXFP8 MoE quantization',
+            )
 
         # Mark as transformed
         layer._mxfp8_transformed = True
@@ -408,6 +707,23 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
             raise RuntimeError(err_msg)
 
         orig_shapes = layer._mxfp8_original_shapes
+
+        if self.online_quantization:
+            checkpoint_state = layer._mxfp8_online_checkpoint
+            for weight_name, scale_name in (
+                ('w13_weight', 'w13_weight_scale'),
+                ('w2_weight', 'w2_weight_scale'),
+            ):
+                weight_shape, weight_dtype = checkpoint_state[weight_name]
+                _allocate_reload_parameter(layer, weight_name, weight_shape, weight_dtype)
+                _allocate_reload_parameter(
+                    layer,
+                    scale_name,
+                    checkpoint_state[scale_name],
+                    torch.uint8,
+                )
+            layer._mxfp8_transformed = False
+            return
 
         def _restore(weight_key: str, scale_key: str):
             """Helper to restore a single MoE weight and its scale using safe memory copies."""
